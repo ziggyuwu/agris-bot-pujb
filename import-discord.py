@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 import json
 import os
 from dotenv import load_dotenv
+import re
+from functools import lru_cache
 
 # Load environment variables from .env file
 load_dotenv()
@@ -13,20 +15,43 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Optimization: Compiled date patterns for faster parsing
+DATE_PATTERNS = [
+    (re.compile(r'^(\d{1,2})/(\d{1,2})/(\d{4})$'), "%d/%m/%Y"),
+    (re.compile(r'^(\d{1,2})-(\d{1,2})-(\d{4})$'), "%d-%m-%Y"),
+]
+
+# Stats cache: server_key -> (cached_stats, records_hash)
+stats_cache = {}
+
+def _hash_records(records):
+    """Quick hash of records for cache invalidation."""
+    return hash(tuple(sorted((str(k), tuple(sorted(v["active"])), tuple(sorted(v["crossed"]))) for k, v in records.items())))
+
 
 # --- NEW PAGINATION CLASS ---
 class PaginatorView(View):
-    def __init__(self, chunks, title, footer_base):
+    def __init__(self, lines, title, footer_base, per_page=20):
         super().__init__(timeout=120)
-        self.chunks = chunks
+        self.lines = lines
         self.title = title
         self.footer_base = footer_base
+        self.per_page = per_page
         self.current_page = 0
+
+    @property
+    def total_pages(self):
+        return max(1, (len(self.lines) + self.per_page - 1) // self.per_page)
+
+    def get_page_text(self, page_index):
+        start = page_index * self.per_page
+        end = start + self.per_page
+        return "\n".join(self.lines[start:end])
 
     async def update_embed(self, interaction):
         embed = discord.Embed(
-            title=f"{self.title} (Page {self.current_page + 1}/{len(self.chunks)})",
-            description=self.chunks[self.current_page],
+            title=f"{self.title} (Page {self.current_page + 1}/{self.total_pages})",
+            description=self.get_page_text(self.current_page),
             color=0x5865F2
         )
         embed.set_footer(text=self.footer_base)
@@ -40,7 +65,7 @@ class PaginatorView(View):
 
     @discord.ui.button(label="▶", style=discord.ButtonStyle.gray)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_page < len(self.chunks) - 1:
+        if self.current_page < self.total_pages - 1:
             self.current_page += 1
             await self.update_embed(interaction)
 
@@ -51,23 +76,23 @@ async def send_paginated_embed(ctx, title, lines, color, footer_base, per_page=2
         await ctx.send("No entries to display.")
         return
 
-    chunks = ["\n".join(lines[i:i + per_page]) for i in range(0, len(lines), per_page)]
+    total_pages = max(1, (len(lines) + per_page - 1) // per_page)
+    first_page = "\n".join(lines[:per_page])
     embed = discord.Embed(
-        title=f"{title} (Page 1/{len(chunks)})",
-        description=chunks[0],
+        title=f"{title} (Page 1/{total_pages})",
+        description=first_page,
         color=color,
     )
     embed.set_footer(text=footer_base)
 
-    if len(chunks) == 1:
+    if total_pages == 1:
         await ctx.send(embed=embed)
         return
 
-    view = PaginatorView(chunks, title, footer_base)
+    view = PaginatorView(lines, title, footer_base, per_page=per_page)
     await ctx.send(embed=embed, view=view)
 
-# Storage per server: {server_key: {date_obj: {"active": set[str], "crossed": set[str]}}}
-server_records = {}
+# Storage shape per server: {date_obj: {"active": set[str], "crossed": set[str]}}
 server_settings = {}
 
 # File persistence
@@ -156,9 +181,6 @@ def has_management_access():
 
 def load_records(server_key):
     """Load records for one server key from its JSON file."""
-    if server_key in server_records:
-        return server_records[server_key]
-
     records = {}
     records_file = get_records_file(server_key)
     if os.path.exists(records_file):
@@ -175,14 +197,12 @@ def load_records(server_key):
         except Exception as e:
             print(f"Error loading records for {server_key}: {e}")
 
-    server_records[server_key] = records
     return records
 
 
-def save_records(server_key):
+def save_records(server_key, records):
     """Save records for one server key to its JSON file."""
     try:
-        records = server_records.get(server_key, {})
         data = {}
         for date_obj, record in records.items():
             date_str = date_obj.isoformat()
@@ -191,8 +211,12 @@ def save_records(server_key):
                 "crossed": sorted(record["crossed"])
             }
         records_file = get_records_file(server_key)
+        # Use compact JSON (no indent) to reduce disk I/O and local storage
         with open(records_file, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f)
+        # Invalidate stats cache for this server
+        if server_key in stats_cache:
+            del stats_cache[server_key]
     except Exception as e:
         print(f"Error saving records for {server_key}: {e}")
 
@@ -215,9 +239,16 @@ async def on_message(message):
 
 def parse_date(date_str):
     """Parse supported date formats using day-month-year ordering."""
+    # Try regex patterns first (faster than strptime for simple formats)
+    for pattern, fmt in DATE_PATTERNS:
+        if pattern.match(date_str):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                pass
+    
+    # Fallback to remaining formats
     formats = [
-        "%d/%m/%Y",
-        "%d-%m-%Y",
         "%d %m %Y",
         "%d %B %Y",
         "%d %b %Y",
@@ -231,35 +262,46 @@ def parse_date(date_str):
     raise ValueError("Invalid date format")
 
 
-def _find_first_date(value):
-    """Recursively find the first `date` field in a JSON object/list."""
+def _find_first_date(value, depth=0, max_depth=20):
+    """Recursively find the first `date` field in a JSON object/list.
+    Limit recursion depth to prevent stack overflow on malformed JSON.
+    """
+    if depth > max_depth:
+        return None
+    
     if isinstance(value, dict):
         for key, val in value.items():
             if str(key).lower() == "date" and isinstance(val, str):
                 return val
         for val in value.values():
-            found = _find_first_date(val)
+            found = _find_first_date(val, depth + 1, max_depth)
             if found:
                 return found
     elif isinstance(value, list):
         for item in value:
-            found = _find_first_date(item)
+            found = _find_first_date(item, depth + 1, max_depth)
             if found:
                 return found
     return None
 
 
-def _collect_signup_entries(value, entries):
-    """Collect objects that look like signup rows with name/status/classname keys."""
+def _collect_signup_entries(value, entries, depth=0, max_depth=20):
+    """Collect objects that look like signup rows with name/status/classname keys.
+    Limit recursion depth to prevent stack overflow.
+    """
+    if depth > max_depth:
+        return
+    
     if isinstance(value, dict):
-        lowered = {str(k).lower(): v for k, v in value.items()}
-        if "name" in lowered and "status" in lowered:
-            entries.append(lowered)
+        # Fast-path: check raw keys first before lowering
+        keys_lower = {k.lower() if isinstance(k, str) else str(k).lower() for k in value.keys()}
+        if "name" in keys_lower and "status" in keys_lower:
+            entries.append({str(k).lower(): v for k, v in value.items()})
         for val in value.values():
-            _collect_signup_entries(val, entries)
+            _collect_signup_entries(val, entries, depth + 1, max_depth)
     elif isinstance(value, list):
         for item in value:
-            _collect_signup_entries(item, entries)
+            _collect_signup_entries(item, entries, depth + 1, max_depth)
 
 
 def parse_signups_from_json_payload(payload):
@@ -389,7 +431,15 @@ def compute_crossed_streak_by_appearances(active_dates, crossed_dates):
 
 
 def build_stats(daily_records):
-    """Build per-name stats from daily records."""
+    """Build per-name stats from daily records with caching."""
+    # Create a server-independent cache key based on records content
+    records_hash = _hash_records(daily_records)
+    
+    # Check if we have cached stats for this exact set of records
+    cache_key = "_stats"
+    if cache_key in stats_cache and stats_cache[cache_key][1] == records_hash:
+        return stats_cache[cache_key][0]
+    
     active_dates_by_name = {}
     crossed_dates_by_name = {}
 
@@ -412,7 +462,9 @@ def build_stats(daily_records):
             "crossed_current_streak": crossed_current,
             "crossed_longest_streak": crossed_longest,
         }
-
+    
+    # Cache the computed stats
+    stats_cache[cache_key] = (stats, records_hash)
     return stats
 
 
@@ -426,7 +478,7 @@ async def process_json_attachment(attachment, server_key):
 
     # Latest upload wins for the same date (overwrite, do not merge).
     daily_records[screenshot_date] = {"active": set(active), "crossed": set(crossed)}
-    save_records(server_key)
+    save_records(server_key, daily_records)
     return screenshot_date, active, crossed
 
 
@@ -437,12 +489,7 @@ async def record(ctx):
     """Record one JSON upload.
     Usage: !record (attach .json)
     """
-    json_attachment = None
-    for attachment in ctx.message.attachments:
-        if _is_json_attachment(attachment):
-            json_attachment = attachment
-            break
-
+    json_attachment = next((a for a in ctx.message.attachments if _is_json_attachment(a)), None)
     if not json_attachment:
         await ctx.send("Please attach a .json file.")
         return
@@ -450,7 +497,8 @@ async def record(ctx):
     try:
         server_key = get_server_key(ctx.guild.id if ctx.guild else None, ctx.author.id)
         screenshot_date, active, crossed = await process_json_attachment(json_attachment, server_key)
-        stats = build_stats(load_records(server_key))
+        daily_records = load_records(server_key)
+        stats = build_stats(daily_records)
 
         embed = discord.Embed(
             title=f"Recorded Signups - {screenshot_date.isoformat()}",
@@ -487,12 +535,7 @@ async def auto_record(ctx):
         await ctx.send("Please attach a .json file.")
         return
 
-    json_attachment = None
-    for attachment in ctx.message.attachments:
-        if _is_json_attachment(attachment):
-            json_attachment = attachment
-            break
-
+    json_attachment = next((a for a in ctx.message.attachments if _is_json_attachment(a)), None)
     if not json_attachment:
         await ctx.send("Attachment must be a .json file.")
         return
@@ -501,7 +544,8 @@ async def auto_record(ctx):
         server_key = get_server_key(ctx.guild.id if ctx.guild else None, ctx.author.id)
         screenshot_date, active, crossed = await process_json_attachment(json_attachment, server_key)
 
-        stats = build_stats(load_records(server_key))
+        daily_records = load_records(server_key)
+        stats = build_stats(daily_records)
 
         embed = discord.Embed(
             title=f"Recorded Signups - {screenshot_date.isoformat()}",
@@ -532,8 +576,7 @@ async def auto_record(ctx):
 async def otterreset(ctx):
     """Reset all tallies"""
     server_key = get_server_key(ctx.guild.id if ctx.guild else None, ctx.author.id)
-    server_records[server_key] = {}
-    save_records(server_key)
+    save_records(server_key, {})
     await ctx.send("Tallies reset!")
 
 @bot.command()
@@ -547,22 +590,23 @@ async def tally(ctx):
         return
 
     latest_date = max(daily_records.keys())
-    latest_active_names = set(daily_records[latest_date]["active"])
-    latest_crossed_names = set(daily_records[latest_date]["crossed"])
-    all_names = sorted(stats.keys())
-    if not all_names:
-        await ctx.send("No tracked names found.")
-        return
+    latest_active_names = daily_records[latest_date]["active"]
+    latest_crossed_names = daily_records[latest_date]["crossed"]
 
-    # Tally view is alphabetical.
-    sorted_names = sorted(all_names, key=lambda n: n.casefold())
+    # Sort names case-insensitively
+    sorted_names = sorted(stats.keys(), key=lambda n: n.casefold())
 
+    # Pre-convert sets to lowercase for O(1) lookups
+    active_set = {n.lower() for n in latest_active_names}
+    crossed_set = {n.lower() for n in latest_crossed_names}
+    
     lines = []
     for name in sorted_names:
         s = stats[name]
-        if name in latest_crossed_names:
+        name_lower = name.lower()
+        if name_lower in crossed_set:
             status = "benched"
-        elif name in latest_active_names:
+        elif name_lower in active_set:
             status = "active"
         else:
             status = "no signup"
@@ -614,6 +658,79 @@ async def agris(ctx):
     )
 
 
+@bot.command(name="highbench")
+async def highbench(ctx):
+    """Show players with bench streak over 4.
+    Usage: !highbench
+    """
+    server_key = get_server_key(ctx.guild.id if ctx.guild else None, ctx.author.id)
+    daily_records = load_records(server_key)
+    stats = build_stats(daily_records)
+    if not stats:
+        await ctx.send("No records found yet.")
+        return
+
+    # Filter players with bench streak > 4
+    high_bench = [(name, s) for name, s in stats.items() if s["crossed_current_streak"] >= 4]
+    
+    if not high_bench:
+        await ctx.send("No players with bench streak over 4.")
+        return
+    
+    # Sort by current bench streak descending
+    high_bench.sort(key=lambda x: -x[1]["crossed_current_streak"])
+    
+    lines = []
+    for name, s in high_bench:
+        lines.append(
+            f"**{name}**: Benched Streak {s['crossed_current_streak']} (best {s['crossed_longest_streak']})"
+        )
+    
+    await send_paginated_embed(
+        ctx=ctx,
+        title="Players with Bench Streak > 4",
+        lines=lines,
+        color=0xFF6B6B,
+        footer_base=f"Total: {len(lines)} players",
+        per_page=20,
+    )
+
+
+@bot.command(name="activestreak")
+async def activestreak(ctx):
+    """Show players sorted by active streak from highest to lowest.
+    Usage: !activestreak
+    """
+    server_key = get_server_key(ctx.guild.id if ctx.guild else None, ctx.author.id)
+    daily_records = load_records(server_key)
+    stats = build_stats(daily_records)
+    if not stats:
+        await ctx.send("No records found yet.")
+        return
+    
+    # Sort by active current streak descending, then by active longest streak
+    sorted_names = sorted(
+        stats.items(),
+        key=lambda x: (-x[1]["active_current_streak"], -x[1]["active_longest_streak"])
+    )
+    
+    lines = []
+    for name, s in sorted_names:
+        lines.append(
+            f"**{name}**: Active Streak {s['active_current_streak']} (best {s['active_longest_streak']})"
+        )
+    
+    latest_date = max(daily_records.keys()).isoformat() if daily_records else "N/A"
+    await send_paginated_embed(
+        ctx=ctx,
+        title="Active Streak Rankings (Highest to Lowest)",
+        lines=lines,
+        color=0x51CF66,
+        footer_base=f"Total Tracked: {len(stats)} | Last Sync: {latest_date}",
+        per_page=20,
+    )
+
+
 @bot.command(name="removeplayer")
 @commands.guild_only()
 @has_management_access()
@@ -629,12 +746,13 @@ async def removeplayer(ctx, *, name: str):
         await ctx.send("Please provide a player name. Example: !removeplayer EBOY3")
         return
 
+    target_lower = target.casefold()
     removed_active = 0
     removed_benched = 0
 
     for _, record in daily_records.items():
-        active_match = next((n for n in record["active"] if n.casefold() == target.casefold()), None)
-        benched_match = next((n for n in record["crossed"] if n.casefold() == target.casefold()), None)
+        active_match = next((n for n in record["active"] if n.casefold() == target_lower), None)
+        benched_match = next((n for n in record["crossed"] if n.casefold() == target_lower), None)
 
         if active_match is not None:
             record["active"].remove(active_match)
@@ -647,11 +765,43 @@ async def removeplayer(ctx, *, name: str):
         await ctx.send(f"No tracked entries found for '{target}'.")
         return
 
-    save_records(server_key)
+    save_records(server_key, daily_records)
     await ctx.send(
         f"Removed '{target}' from tracking. "
         f"Active removals: {removed_active}, Benched removals: {removed_benched}."
     )
+
+
+@bot.command(name="resetbenchstreak")
+@commands.guild_only()
+@has_management_access()
+async def resetbenchstreak(ctx, *, name: str):
+    """Reset bench streak for a specific player.
+    Usage: !resetbenchstreak <name>
+    """
+    server_key = get_server_key(ctx.guild.id if ctx.guild else None, ctx.author.id)
+    daily_records = load_records(server_key)
+
+    target = name.strip()
+    if not target:
+        await ctx.send("Please provide a player name. Example: !resetbenchstreak EBOY3")
+        return
+
+    target_lower = target.casefold()
+    removed_count = 0
+
+    for _, record in daily_records.items():
+        benched_match = next((n for n in record["crossed"] if n.casefold() == target_lower), None)
+        if benched_match is not None:
+            record["crossed"].remove(benched_match)
+            removed_count += 1
+
+    if removed_count == 0:
+        await ctx.send(f"No bench streak entries found for '{target}'.")
+        return
+
+    save_records(server_key, daily_records)
+    await ctx.send(f"Reset bench streak for '{target}'. Removed {removed_count} benched entries.")
 
 
 @bot.command(name="roleadd")
@@ -675,7 +825,7 @@ async def roleadd(ctx, *, role_name: str):
     set_management_role_name(server_key, matched_role.name)
     await ctx.send(
         f"Management role set to '{matched_role.name}'. "
-        "Users with this role can use !record, !auto, !removeplayer, and !otterreset."
+        "Users with this role can use !record, !auto, !removeplayer, !resetbenchstreak, and !otterreset."
     )
 
 
@@ -708,8 +858,28 @@ async def helpagris(ctx):
         inline=False,
     )
     embed.add_field(
+        name="!highbench",
+        value="Shows players with bench streak over 4.",
+        inline=False,
+    )
+    embed.add_field(
+        name="!activestreak",
+        value="Shows all players sorted by active streak from highest to lowest.",
+        inline=False,
+    )
+    embed.add_field(
         name="!removeplayer <name>",
         value="Removes a player from all tracked records for this server.",
+        inline=False,
+    )
+    embed.add_field(
+        name="!resetbenchstreak <name>",
+        value="Resets bench streak for a specific player (removes queued entries).",
+        inline=False,
+    )
+    embed.add_field(
+        name="!export",
+        value="Export all stats and records as a copyable text file.",
         inline=False,
     )
     embed.add_field(
@@ -734,6 +904,69 @@ async def helpagris(ctx):
     )
     embed.set_footer(text="Benched streak counts consecutive queued appearances and resets when active.")
     await ctx.send(embed=embed)
+
+
+@bot.command(name="export")
+async def export_data(ctx):
+    """Export all stats and records as a copyable text file.
+    Usage: !export
+    """
+    server_key = get_server_key(ctx.guild.id if ctx.guild else None, ctx.author.id)
+    daily_records = load_records(server_key)
+    stats = build_stats(daily_records)
+    
+    if not stats:
+        await ctx.send("No records to export yet.")
+        return
+    
+    # Generate text content
+    lines = []
+    lines.append(f"=== Agris Bot Export ===")
+    lines.append(f"Server: {ctx.guild.name if ctx.guild else 'DM'}")
+    lines.append(f"Exported: {datetime.now().isoformat()}")
+    lines.append("")
+    
+    # Stats summary
+    lines.append(f"Total Tracked Players: {len(stats)}")
+    lines.append("")
+    lines.append("=== Player Stats ===")
+    lines.append("")
+    
+    sorted_names = sorted(stats.items(), key=lambda x: (-x[1]["crossed_longest_streak"], -x[1]["crossed_current_streak"]))
+    for name, s in sorted_names:
+        lines.append(f"{name}:")
+        lines.append(f"  Active Current Streak: {s['active_current_streak']}")
+        lines.append(f"  Active Longest Streak: {s['active_longest_streak']}")
+        lines.append(f"  Bench Current Streak: {s['crossed_current_streak']}")
+        lines.append(f"  Bench Longest Streak: {s['crossed_longest_streak']}")
+        lines.append("")
+    
+    # Daily records
+    lines.append("=== Daily Records ===")
+    lines.append("")
+    for date_obj in sorted(daily_records.keys()):
+        record = daily_records[date_obj]
+        lines.append(f"Date: {date_obj.isoformat()}")
+        lines.append(f"  Active: {', '.join(sorted(record['active'])) if record['active'] else 'None'}")
+        lines.append(f"  Benched: {', '.join(sorted(record['crossed'])) if record['crossed'] else 'None'}")
+        lines.append("")
+    
+    text_content = "\n".join(lines)
+    
+    # Save to local file
+    export_dir = "exports"
+    os.makedirs(export_dir, exist_ok=True)
+    filename = f"{export_dir}/export_{server_key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    
+    try:
+        with open(filename, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text_content)
+        
+        # Send as Discord attachment
+        with open(filename, "rb") as f:
+            await ctx.send(f"Export completed. Records saved to {os.path.basename(filename)}", file=discord.File(f, os.path.basename(filename)))
+    except Exception as e:
+        await ctx.send(f"Error exporting data: {e}")
 
 
 @bot.event
