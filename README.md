@@ -1,0 +1,2 @@
+This is a Discord bot built to track guild signup activity over time.
+It reads JSON uploads, logs who was active vs benched each day, and turns that into streak stats your team can actually use. You can view tallies, rank members by bench or active streaks, reset streaks when needed, and export everything to a clean text file for sharing. It is role-protected for management actions and keeps each server’s data separate, so it stays organized and safe to use across multiple communities.
