@@ -161,13 +161,26 @@ async def send_paginated_embed(ctx, title, lines, color, footer_text):
 # --- COMMANDS ---
 
 @bot.command(name="setadminrole")
-@commands.has_permissions(administrator=True)
+@commands.has_permissions(administrator=True) # Ensures only server owners/admins can run this
+@commands.guild_only() # Prevents this command from being used in DMs
 async def set_management_role(ctx, role: discord.Role):
+    # 1. Get the unique ID for THIS server
     server_key = str(ctx.guild.id)
+    
+    # 2. Load the existing settings dictionary
     settings = load_settings()
-    settings.setdefault(server_key, {})["management_role_id"] = role.id
+    
+    # 3. Update ONLY the entry for this specific server
+    # .setdefault ensures the server_key exists before we assign the role ID
+    if server_key not in settings:
+        settings[server_key] = {}
+        
+    settings[server_key]["management_role_id"] = role.id
+    
+    # 4. Save the updated dictionary back to your JSON file
     save_settings(settings)
-    await ctx.send(f"✅ Management role set to **{role.name}**.")
+    
+    await ctx.send(f"✅ Management role for **{ctx.guild.name}** set to **{role.name}**.")
 
 @bot.command(name="auto")
 @has_management_access()
@@ -227,9 +240,15 @@ async def auto_record(ctx):
 
 @bot.command(name="syncagris")
 @commands.guild_only()
-@has_management_access() # <--- Use this instead of administrator=True
+@has_management_access()
 async def sync_agris_roles(ctx):
     server_key = str(ctx.guild.id)
+    
+    # --- NEW: Load the custom threshold ---
+    settings = load_settings()
+    # Get the threshold for this server, default to 4 if not set
+    threshold = settings.get(server_key, {}).get("agris_threshold", 4)
+    
     daily_records = load_records(server_key)
     stats = build_stats(daily_records)
     
@@ -243,21 +262,24 @@ async def sync_agris_roles(ctx):
         member = ctx.guild.get_member(int(user_id_str))
         if member:
             try:
-                should_have = user_stat["crossed_current_streak"] >= 4
+                # Use the 'threshold' variable instead of the hardcoded 4
+                should_have = user_stat["crossed_current_streak"] >= threshold
                 has_role = agris_role in member.roles
+                
                 if should_have and not has_role:
-                    await member.add_roles(agris_role); updates["added"] += 1
+                    await member.add_roles(agris_role)
+                    updates["added"] += 1
                 elif not should_have and has_role:
-                    await member.remove_roles(agris_role); updates["removed"] += 1
+                    await member.remove_roles(agris_role)
+                    updates["removed"] += 1
             except:
                 updates["failed"] += 1
         else:
             updates["unlinked"] += 1
 
-    embed = discord.Embed(title="Agris Sync Result", color=0x2ECC71)
+    embed = discord.Embed(title=f"Agris Sync Result (Threshold: {threshold})", color=0x2ECC71)
     embed.add_field(name="Added", value=str(updates["added"]))
     embed.add_field(name="Removed", value=str(updates["removed"]))
-    embed.add_field(name="Not in Server", value=str(updates["unlinked"]))
     await ctx.send(embed=embed)
 
 @bot.command(name="agrischeck")
@@ -282,6 +304,8 @@ async def agris_ranking(ctx):
     server_key = get_server_key(ctx.guild.id)
     daily_records = load_records(server_key)
     stats = build_stats(daily_records)
+    settings = load_settings()
+    threshold = settings.get(server_key, {}).get("agris_threshold", 4)
     if not stats: return await ctx.send("No records found.")
 
     # Sort the stats
@@ -297,13 +321,32 @@ async def agris_ranking(ctx):
         member = ctx.guild.get_member(int(u_id_str))
         name = member.display_name if member else f"User({u_id_str})"
         
-        emoji = "🔥 " if s['crossed_current_streak'] >= 4 else ""
+        emoji = "🔥 " if s['crossed_current_streak'] >= threshold else ""
         lines.append(
             f"{emoji}**{name}**: Bench: **{s['crossed_current_streak']}** | "
             f"Best: {s['crossed_longest_streak']} | Active: {s['active_current_streak']}"
         )
     
     await send_paginated_embed(ctx, "Agris Rankings", lines, 0x5865F2, "Use buttons to scroll")
+
+@bot.command(name="setthreshold")
+@commands.guild_only()
+@has_management_access()
+async def set_agris_threshold(ctx, amount: int):
+    """Sets the number of benches required to get the Agris role."""
+    if amount < 1:
+        return await ctx.send("❌ Threshold must be at least 1.")
+
+    server_key = str(ctx.guild.id)
+    settings = load_settings()
+    
+    if server_key not in settings:
+        settings[server_key] = {}
+        
+    settings[server_key]["agris_threshold"] = amount
+    save_settings(settings)
+    
+    await ctx.send(f"✅ Success! Users now need a bench streak of **{amount}** to receive the Agris role in this server.")
 
 @bot.command(name="untrack")
 @commands.guild_only()
@@ -375,6 +418,62 @@ async def reset_bench_streak(ctx, member: discord.Member):
     save_records(server_key, records)
 
     await ctx.send(f"✅ Reset bench streak for **{member.display_name}** (updated latest record: {latest_date})")
+
+@bot.command(name="agrishelp")
+@commands.guild_only()
+async def help(ctx):
+    server_key = str(ctx.guild.id)
+    settings = load_settings()
+    
+    # Get current server config for the footer/info
+    current_threshold = settings.get(server_key, {}).get("agris_threshold", 4)
+    role_id = settings.get(server_key, {}).get("management_role_id")
+    role_mention = f"<@&{role_id}>" if role_id else "Not Set"
+
+    embed = discord.Embed(
+        title="🛡️ Agris Tracking Help",
+        description="Attendance and bench streak management for multi-server setups.",
+        color=0x5865F2
+    )
+
+    # --- ADMIN COMMANDS ---
+    embed.add_field(
+        name="⚙️ Admin Setup (Server Owner Only)",
+        value=(
+            f"`!setadminrole @role` - Define which role manages the bot.\n"
+            f"`!setthreshold <#>` - Set bench streak needed for Agris (Current: **{current_threshold}**)."
+        ),
+        inline=False
+    )
+
+    # --- MANAGEMENT COMMANDS ---
+    embed.add_field(
+        name="🛠️ Management (Requires " + (f"@{ctx.guild.get_role(role_id).name}" if role_id and ctx.guild.get_role(role_id) else "Admin Role") + ")",
+        value=(
+            "`!auto [attach .json]` - Process a signup export file.\n"
+            "`!syncagris` - Update 'Agris' roles based on current streaks.\n"
+            "`!untrack <id>` - Wipe a user from all history.\n"
+            "`!resetbench @member` - Force reset a user's bench streak."
+        ),
+        inline=False
+    )
+
+    # --- USER COMMANDS ---
+    embed.add_field(
+        name="📊 Statistics & Rankings",
+        value=(
+            "`!agris` - View server leaderboard.\n"
+            "`!agrischeck` - Check your personal streaks."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text=f"Server: {ctx.guild.name} | Active Threshold: {current_threshold}", 
+        icon_url=ctx.guild.icon.url if ctx.guild.icon else None
+    )
+    
+    await ctx.send(embed=embed)
 
 token = os.getenv("DISCORD_TOKEN")
 if not token:
