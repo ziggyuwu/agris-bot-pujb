@@ -1,0 +1,37 @@
+Since you are storing Discord IDs and server data to track streaks, your Privacy Policy needs to be transparent about Data Minimization (only collecting what is needed).
+
+Below are templates for both files. You should create two separate files in your GitHub repository: PRIVACY.md and TOS.md.
+
+1. Privacy Policy (PRIVACY.md)
+Markdown
+# Privacy Policy for Agris Bot
+
+**Last Updated: April 24, 2026**
+
+Agris Bot ("the Bot") is committed to protecting the privacy of its users. This policy outlines what data is collected, how it is used, and your rights regarding that data.
+
+### 1. Data Collection
+The Bot collects and stores the following information:
+* **User IDs:** Discord Snowflake IDs are stored to track attendance and bench streaks.
+* **Guild (Server) IDs:** Used to store server-specific settings, such as custom thresholds and admin roles.
+* **Role IDs:** Used to identify the "Agris" role and "Management" roles for permission checks.
+
+### 2. How Data is Used
+Collected data is used strictly for the following purposes:
+* Calculating bench streaks and active attendance.
+* Automating the assignment of the "Agris" role based on server-defined thresholds.
+* Restricting administrative commands to authorized roles.
+
+### 3. Data Storage and Security
+* Data is stored in a private JSON format on a secure server. 
+* We do not sell, trade, or share your data with third parties.
+* Data is not used for profiling or advertising.
+
+### 4. Data Deletion
+Users can request data removal through the following means:
+* **Server Admins:** Can use the `!untrack <id>` command to wipe a specific user's history from the records.
+* **Direct Request:** Users may contact the developer (ohlsonzach) to request a manual wipe of their data.
+* **Bot Removal:** If the Bot is kicked from a server, settings for that server remain but can be deleted upon request.
+
+### 5. Third-Party Services
+The Bot interacts with the Discord API. Please refer to the [Discord Privacy Policy](https://d
